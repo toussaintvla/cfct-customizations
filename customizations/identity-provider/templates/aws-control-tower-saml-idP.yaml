@@ -1,0 +1,147 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates the IAM identity provider within an account
+
+Parameters:
+  pSamlProviderName:
+    Description: Name of SAML provider to be created
+    Type: String
+    Default: Federation_idP
+    AllowedPattern: "^[a-zA-Z0-9\\.\\_\\-]{1,128}$"
+  pSamlMetadataBucket:
+    Description: Name of existing S3 bucket where the SAML metadata file resides
+    Type: String
+  pSamlMetadataFilename:
+    Description: Name of existing XML SAML metadata filename in the S3 bucket above
+    Type: String
+    Default: FederationMetadata(SSO2_PROD).xml
+
+Resources:
+##########################################
+# IAM Role for SAML Provider             #
+##########################################
+  CreateSamlIdentityProviderServiceRole:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F5
+            reason: Policy applies to all resources within account
+          - id: W13
+            reason: Policy applies to all resources within account
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName: !Sub cfct-${AWS::AccountId}-SamlIdentityProviderLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: SAMLPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                - !Sub arn:aws:s3:::${pSamlMetadataBucket}/${pSamlMetadataFilename}
+              - Effect: Allow
+                Action:
+                  - iam:CreateSAMLProvider
+                  - iam:UpdateSAMLProvider
+                  - iam:DeleteSAMLProvider
+                  - iam:ListSAMLProviders
+                Resource:
+                  - "*"
+
+##########################################
+# Create/Update SAML Provider            #
+##########################################
+  CreateSamlIdentityProviderResource:
+    Type: Custom::CreateSamlIdentityProvider
+    Properties:
+      ServiceToken: !GetAtt CreateSamlIdentityProvider.Arn
+      Region: !Ref "AWS::Region"
+      Name: !Ref pSamlProviderName
+      BucketName: !Ref pSamlMetadataBucket
+      Metadata: !Ref pSamlMetadataFilename
+      ProviderArn: !Sub arn:aws:iam::${AWS::AccountId}:saml-provider/${pSamlProviderName}
+
+  CreateSamlIdentityProvider:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Creates the SAML identity provider
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateSamlIdentityProviderServiceRole.Arn
+      Runtime: python3.7
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+          import botocore
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              responseData = {}
+              saml_provider_exists = False # prove otherwise
+
+              # First, determine whether the SAML provider already exists.
+              for saml_provider in boto3.client('iam').list_saml_providers()['SAMLProviderList']:
+                  saml_provider_exists = saml_provider_exists or event['ResourceProperties']['ProviderArn'] == saml_provider['Arn']
+
+              # print('SAML provider {} exists: {}'.format(event['ResourceProperties']['ProviderArn'], saml_provider_exists))
+
+              # Only execute in a custom CloudFormation resource creation or update event.
+              if not saml_provider_exists and ('RequestType' in event and event['RequestType'] in ['Create', 'Update']):
+
+                  try:
+                      # Specify the local filename.
+                      local_filename = '/tmp/' + event['ResourceProperties']['Metadata']
+
+                      # Download the file from S3 to a local file.
+                      boto3.resource('s3').Bucket(event['ResourceProperties']['BucketName']).download_file(
+                          event['ResourceProperties']['Metadata'],
+                          local_filename
+                      )
+
+                      # Get the contents of the file.
+                      file = open(local_filename, 'r')
+                      file_contents = file.read()
+                      file.close()
+
+                      # Create the SAML provider and provide the metatdata document.
+                      boto3.resource('iam').create_saml_provider(
+                          SAMLMetadataDocument = file_contents,
+                          Name = event['ResourceProperties']['Name']
+                      )
+
+                  except botocore.exceptions.ClientError as e:
+                      if e.response['Error']['Code'] == '404':
+                          print('The file {} does not exist in the bucket {}.'.format(event['ResourceProperties']['Metadata'], event['ResourceProperties']['BucketName']))
+                      else:
+                          raise
+
+              elif saml_provider_exists and ('RequestType' in event and event['RequestType'] == 'Delete'):
+                  response = boto3.client('iam').delete_saml_provider(
+                      SAMLProviderArn = event['ResourceProperties']['ProviderArn']
+                  )
+
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, responseData)

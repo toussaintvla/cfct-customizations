@@ -1,0 +1,216 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Deploys resources to create support cases for business support on CT Lifecycle Events
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'Resource Options'
+        Parameters:
+          - pSnsTopicName
+          - pEmailAddress
+
+    ParameterLabels:
+      pSnsTopicName:
+        default: SNS Topic Name
+      pEmailAddress:
+        default: Email Address for CC
+
+Parameters:
+
+  pSnsTopicName:
+    Type: String
+    Default: control-tower-lifecycle-event-business-support
+
+  pEmailAddress:
+    Type: String
+    AllowedPattern: ^\w+@[a-zA-Z_\.]+?\.[a-zA-Z]{2,3}$
+
+
+
+Resources:
+
+# Cloudwatch Event Rule for Lifecycle Event (LE): triggered by LE events and send events to SNS
+  rControlTowerLifecycleEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Custom Control Tower - Rule for lifecycle events from Control Tower Service
+      EventPattern:
+        {
+          "detail-type": [
+            "AWS Service Event via CloudTrail"
+          ],
+          "source": [
+              "aws.controltower"
+          ],
+          "detail": {
+              "eventName": [
+                  "CreateManagedAccount"
+              ],
+              "serviceEventDetails": {
+                "createManagedAccountStatus": {
+                  "state": [
+                    "SUCCEEDED"
+                  ]
+                }
+              }
+          }
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !Ref rControlTowerLifecycleNotificationSns
+          Id: "Control_Tower_Lifecycle_Event"
+
+  rControlTowerLifecycleNotificationSns:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${pSnsTopicName}-${AWS::AccountId}-${AWS::Region}'
+
+  rControlTowerSnsAccessPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action:
+            - SNS:GetTopicAttributes
+            - SNS:SetTopicAttributes
+            - SNS:AddPermission
+            - SNS:RemovePermission
+            - SNS:DeleteTopic
+            - SNS:Subscribe
+            - SNS:ListSubscriptionsByTopic
+            - SNS:Publish
+            - SNS:Receive
+            Resource: !Ref rControlTowerLifecycleNotificationSns
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Ref AWS::AccountId
+          - Sid: CloudWatchSnsPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref rControlTowerLifecycleNotificationSns
+      Topics:
+        - !Ref rControlTowerLifecycleNotificationSns
+
+  rLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: SupportCaseLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: LambdaLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Sid: SupportPermissions
+                Effect: Allow
+                Action:
+                  - support:AddCommunicationToCase
+                  - support:CreateCase
+                  - support:DescribeCaseAttributes
+                  - support:DescribeIssueTypes
+                  - support:DescribeServices
+                  - support:DescribeSeverityLevels
+                  - support:DescribeSupportLevel
+                  - support:PutCaseAttributes
+                Resource: "*"
+
+  rSupportCaseLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.lambda_handler"
+      FunctionName: Business-Support-Case
+      Role: !GetAtt rLambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import os
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          support = boto3.client('support', region_name='us-east-1')
+
+          cc_address = os.environ['EmailAddress']
+
+
+          def lambda_handler(event, context):
+              LOGGER.info("Event: " + str(event))
+              message = json.loads(event['Records'][0]['Sns']['Message'])
+              LOGGER.info("Message: " + str(message))
+
+              try:
+                  account_id = message['detail']['serviceEventDetails']['createManagedAccountStatus']['account']['accountId']
+                  support.create_case(
+                      issueType='customer-service',
+                      serviceCode='account-management',
+                      categoryCode='billing',
+                      severityCode='low',
+                      subject=f'Add Account {account_id} to Business Support',
+                      communicationBody=f'Please add account number {account_id} to our business support plan.',
+                      ccEmailAddresses=[
+                        cc_address
+                      ],
+                      language='en'
+                  )
+              except Exception as e:
+                  LOGGER.error(f'Error generating case for business support: {e}')
+      Runtime: python3.7
+      Timeout: 300
+      Environment:
+        Variables:
+          EmailAddress: !Ref pEmailAddress
+
+  rLifecycleSnsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt rSupportCaseLambda.Arn
+      Protocol: lambda
+      TopicArn: !Ref rControlTowerLifecycleNotificationSns
+
+  rSnsLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref rSupportCaseLambda
+      Principal: sns.amazonaws.com
+
+
+Outputs:
+
+  oControlTowerLifecycleNotificationSns:
+    Description: Target SNS topic for Cloudwatch Event generated on CT account creation succeeding
+    Value: !Ref rControlTowerLifecycleNotificationSns
+    Export:
+      Name: ControlTower-Lifecycle-Support-Sns
+
+  oLambdaArn:
+    Description: The Arn value of the CT Lifecycle Business Support Function
+    Value: !GetAtt rSupportCaseLambda.Arn
+    Export:
+      Name: Support-Case-Lambda

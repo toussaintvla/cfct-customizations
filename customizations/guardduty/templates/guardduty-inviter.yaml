@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates an SNS topic and Lambda function used to enable GuardDuty and configure alert centralization in the Security account.
+
+Parameters:
+  pLambdaFunctionName:
+    Type: String
+    AllowedPattern: '^[\w-]{0,64}$'
+    ConstraintDescription: Max 64 alphanumeric characters. Also special characters supported [_, -]
+    Default: guardduty-org-inviter
+    Description: Lambda Function Name
+  pAuditAccountId:
+    Type: String
+    Description: >
+      The Amazon GuardDuty master account ID.
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: >
+      The Security Account ID must be a 12 character string.
+    MinLength: 12
+    MaxLength: 12
+  pOrganizationId:
+    Type: String
+    Description: >
+      The Amazon Organizations ID for the Landing Zone.
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: '^[o][\-][a-z0-9]{10}$'
+    ConstraintDescription: >
+      The Org Id must be a 12 character string starting with o- and followed by 10 lower case alphanumeric characters
+  pLambdaS3BucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Which S3 bucket contains the gdinviter37.py.zip file for the Inviter lambda function?
+  pLambdaZipFileName:
+    Type: String
+    Default: ''
+    Description: >
+      Which S3 bucket key for gdinviter37.py.zip file
+  pRoleToAssume:
+    Type: String
+    Default: 'AWSControlTowerExecution'
+    Description: >
+      What role should be assumed in child accounts to enable GuardDuty?  The default is AWSControlTowerExecution for a control tower environment.
+  pPublishingDestinationBucketName:
+    Type: String
+    AllowedPattern: "^$|^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$"
+    ConstraintDescription: >
+      S3 bucket name can include numbers, lowercase letters, uppercase letters, and hyphens (-).
+      It cannot start or end with a hyphen (-).
+    Description: GuardDuty S3 bucket name
+  pGuardDutyDeliveryKMSKeyArn:
+    Type: String
+    AllowedPattern: '^arn:(aws[a-zA-Z-]*)?:kms:[a-z0-9-]+:\d{12}:key\/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$'
+    ConstraintDescription: >
+      'Key ARN example:  arn:aws:kms:us-east-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab'
+    Description: >
+      KMS Key ARN to use for encrypting GuardDuty findings sent to S3
+
+Resources:
+  GDAggregatorRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Tags :
+      -
+        Key: Name
+        Value: gdenablerrole
+      -
+        Key: PPFA-managed
+        Value: PPFA-managed
+      -
+        Key: securityrelated
+        Value: true
+      -
+        Key: application
+        Value: lambda
+
+      Policies:
+      - PolicyName: GDAggregatorPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+              - 'organizations:ListAccounts'
+              - 'organizations:DescribeAccount'
+              - 'organizations:ListAWSServiceAccessForOrganization'
+              - 'organizations:ListDelegatedAdministrators'
+              - 'organizations:DescribeOrganization'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                "aws:PrincipalOrgId": !Sub ${pOrganizationId}
+          - Action:
+              - 'organizations:DeregisterDelegatedAdministrator'
+              - 'organizations:DisableAWSServiceAccess'
+              - 'organizations:EnableAWSServiceAccess'
+              - 'organizations:RegisterDelegatedAdministrator'
+            Condition:
+              StringLikeIfExists:
+                organizations:ServicePrincipal: guardduty.amazonaws.com
+            Effect: Allow
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource: !Sub 'arn:aws:iam::*:role/${pRoleToAssume}'
+            Condition:
+              StringEquals:
+                "aws:PrincipalOrgId": !Sub ${pOrganizationId}
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource:
+              -  !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Effect: Allow
+            Action:
+              - 'iam:GetRole'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Resource: !Sub 'arn:aws:iam::*:role/${pRoleToAssume}'
+          - Action:
+              - 'guardduty:DisableOrganizationAdminAccount'
+              - 'guardduty:EnableOrganizationAdminAccount'
+              - 'guardduty:ListDetectors'
+              - 'guardduty:ListOrganizationAdminAccounts'
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - 'guardduty:DeleteDetector'
+              - 'guardduty:ListMembers'
+            Effect: Allow
+            Resource:
+              - !Sub arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*
+              - !Sub arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:/detector/*
+          - Effect: Allow
+            Action:
+              - 'guardduty:AcceptInvitation'
+              - 'guardduty:CreateDetector'
+              - 'guardduty:CreateMembers'
+              - 'guardduty:GetDetector'
+              - 'guardduty:InviteMembers'
+              - 'guardduty:ListInvitations'
+              - 'guardduty:UpdateDetector'
+              - 'guardduty:ListPublishingDestinations'
+              - 'guardduty:UpdateMemberDetectors'
+              - 'guardduty:UpdateOrganizationConfiguration'
+              - 'guardduty:UpdatePublishingDestination'
+              - 'guardduty:CreatePublishingDestination'
+            Resource: '*'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Organizations doesn't have arns, so we have to use an asterisk in the policy"
+
+  GDInviterLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "gdinviter.lambda_handler"
+      FunctionName: !Ref pLambdaFunctionName
+      Description: "GuardDuty Configuration Function"
+      Role: !GetAtt GDAggregatorRole.Arn
+      Code:
+        S3Bucket: !Ref pLambdaS3BucketName
+        S3Key: !Ref pLambdaZipFileName
+      Runtime: "python3.7"
+      MemorySize: 256
+      Timeout: 900
+      Tags :
+      -
+        Key: Name
+        Value: gdenablerlambda
+      -
+        Key: PPFA-managed
+        Value: PPFA-managed
+      -
+        Key: securityrelated
+        Value: true
+      -
+        Key: application
+        Value: guardduty
+
+      Environment:
+        Variables:
+          assume_role: !Sub ${pRoleToAssume}
+          ct_root_account: !Sub ${AWS::AccountId}
+          master_account: !Sub ${pAuditAccountId}
+          delivery_bucket: !Sub ${pPublishingDestinationBucketName}
+          kms_key_arn: !Sub ${pGuardDutyDeliveryKMSKeyArn}
+
+  LambdaEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "GuardDuty Inviter - Event Trigger"
+      EventPattern:
+        source:
+          - aws.controltower
+        detail-type:
+          - AWS Service Event via CloudTrail
+        detail:
+          eventName:
+            - CreateManagedAccount
+          serviceEventDetails:
+            createManagedAccountStatus:
+              state:
+                - SUCCEEDED
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt GDInviterLambda.Arn
+          Id: "DailyInvite"
+
+  PermissionLambdaEventToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GDInviterLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt LambdaEventRule.Arn
+
+  GDInviterLambdaResource:
+    Type: Custom::GDInviterLambda
+    Properties:
+      ServiceToken: !GetAtt GDInviterLambda.Arn

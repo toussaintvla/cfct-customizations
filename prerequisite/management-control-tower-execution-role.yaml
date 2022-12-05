@@ -1,0 +1,73 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Control Tower Execution Role Creation
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Control Tower Role Attributes
+        Parameters:
+          - pAWSControlTowerExecutionRoleName
+          - pOrgMasterAccountId
+          - pTagKey1
+          - pTagValue1
+    ParameterLabels:
+      pOrgMasterAccountId:
+        default: Organization Master Account ID
+      pAWSControlTowerExecutionRoleName:
+        default: AWS Control Tower Execution Role Name
+      pTagKey1:
+        default: Lambda Role Tag Key
+      pTagValue1:
+        default: Lambda Role Tag Value
+
+Parameters:
+  pOrgMasterAccountId:
+    Type: String
+    Description: Organizations master account ID
+  pAWSControlTowerExecutionRoleName:
+    Type: String
+    Description: AWS Control Tower Execution Role Name
+    Default: AWSControlTowerExecution
+  pTagKey1:
+    Type: String
+    Description: Tag key
+    Default: aws-control-tower
+  pTagValue1:
+    Type: String
+    Description: Tag key value
+    Default: managed-by-aws-control-tower
+
+Resources:
+  rAWSControlTowerRole:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "Allow admin role for control tower to execute stack-set"
+          - id: W11
+            reason: "Allow admin role for control tower to execute stack-set"
+    Properties:
+      RoleName: !Ref pAWSControlTowerExecutionRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${pOrgMasterAccountId}:root
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Ref pAWSControlTowerExecutionRoleName
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+      Tags:
+        - Key: !Ref pTagKey1
+          Value: !Ref pTagValue1

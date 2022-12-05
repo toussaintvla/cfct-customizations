@@ -1,0 +1,48 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Control Tower AWS Organizations Role Name
+
+Parameters:
+  pReadAWSOrganizationsRoleName:
+    Type: String
+    Description: Read AWS Organizations Role Name
+    Default: ReadAWSOrganizationsRole
+  pOrganizationId:
+    Type: String
+    Description: Organizations ID
+    Default: 'o-xxxxxxxxxx'
+
+Resources:
+  rReadAWSOrganizationsRole:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F3
+            reason: "Allow aws organizations role"
+          - id: W11
+            reason: "Allow aws organizations role"
+    Properties:
+      RoleName: !Ref pReadAWSOrganizationsRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref 'pOrganizationId'
+              ForAnyValue:StringLike:
+                aws:PrincipalOrgPaths: !Join ['', [!Ref 'pOrganizationId', '/*'] ]
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub ${pReadAWSOrganizationsRoleName}-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeAccount
+                Resource: !Sub 'arn:aws:organizations::${AWS::AccountId}:account/${pOrganizationId}/*'

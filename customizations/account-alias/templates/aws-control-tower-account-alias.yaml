@@ -1,0 +1,195 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Account Alias Template'
+
+Parameters:
+  pPrefix:
+    Description: Enter the Prefix name you want to add for the AWS Account.
+    Type: String
+    Default: ""
+  pFindMatchingString:
+    Description: Enter the matching string to be searched and omitted in the AWS Account email.
+    Type: String
+    Default: "-aws"
+  pOrgMasterAccountId:
+    Type: String
+    Description: Organizations master account ID
+  pReadAWSOrganizationsRoleName:
+    Description: Enter the role name that must be assumed from the management account. This role is used to describe the AWS Accounts in AWS Organizations.
+    Type: String
+    Default: "ReadAWSOrganizationsRole"
+
+Resources:
+##################################
+# IAM Role for Account Alias     #
+##################################
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Resource * is sufficient for this policy"
+          - id: W28
+            reason: "Resource name is sufficient for this policy"
+    Properties:
+      RoleName: !Sub cfct-${AWS::AccountId}-AccountAliasLambdaRole
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub ${AWS::AccountId}-account-alias-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:*:${AWS::AccountId}:log-group:/aws/lambda/*
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeAccount
+                Resource: '*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub arn:aws:iam::${pOrgMasterAccountId}:role/${pReadAWSOrganizationsRoleName}
+              - Effect: Allow
+                Action:
+                  - iam:CreateAccountAlias
+                  - iam:ListAccountAliases
+                  - iam:DeleteAccountAlias
+                  - s3:GetObject
+                Resource: "*"
+
+#####################################################
+# Create/Update Account Alias                       #
+#####################################################
+  CreateUpdateAccountAlias:
+    Type: Custom::AliasNameFunction
+    Properties:
+      ServiceToken: !GetAtt 'AliasNameFunction.Arn'
+      Prefix: !Ref 'pPrefix'
+      OmittedString: !Ref 'pFindMatchingString'
+      OrgMasterAccountId: !Ref 'pOrgMasterAccountId'
+      AccountId: !Ref 'AWS::AccountId'
+
+  AliasNameFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: "Included in attached IAM policy"
+    Properties:
+      Description: This Lambda is a custom resource to set aws account alias
+      Handler: index.lambda_handler
+      Role: !GetAtt 'LambdaBasicExecutionRole.Arn'
+      Runtime: python3.7
+      MemorySize: 128
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import botocore
+          import botocore.exceptions
+          from botocore.vendored import requests
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info('got event {}'.format(event))
+              responseData = {}
+              iam = boto3.client('iam')
+              sts = boto3.client('sts')
+              prefix = event['ResourceProperties']['Prefix']
+              account_id = event['ResourceProperties']['AccountId']
+              master_account_id = event['ResourceProperties']['OrgMasterAccountId']
+              find_to_omit = event['ResourceProperties']['OmittedString']
+
+              if not find_to_omit:
+                find_to_omit = ""
+
+              assumed_role = sts.assume_role(
+                  RoleArn=f"arn:aws:iam::{master_account_id}:role/ReadAWSOrganizationsRole",
+                  RoleSessionName="AssumeReadAWSOrganizationsRole"
+              )
+
+              credentials = assumed_role['Credentials']
+              session_id = credentials['AccessKeyId']
+              session_key = credentials['SecretAccessKey']
+              session_token = credentials['SessionToken']
+
+              session = boto3.session.Session(
+                  aws_access_key_id=session_id,
+                  aws_secret_access_key=session_key,
+                  aws_session_token=session_token
+              )
+
+              org = session.client('organizations')
+
+              alias = org.describe_account(AccountId=account_id)
+              alias = alias['Account']['Email'].lower()
+
+              if alias.find(find_to_omit) == 0 or alias.find(find_to_omit) == -1:
+                alias = alias.split('@')[0]
+              else:
+                alias = alias.split(find_to_omit)[0]
+
+              if prefix:
+                alias = prefix + "-" + alias
+
+              logging.info(prefix)
+              logging.info(account_id)
+              logging.info(alias)
+
+              if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                  try:
+                      ### Creating account alias if alias not present ###
+                      resp = iam.create_account_alias(AccountAlias=alias)
+                      responseData['alias'] = alias
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, responseData['alias'])
+                  except Exception as e:
+                          print(str(e))
+                          try:
+                              if e.response['Error']['Code'] == "EntityAlreadyExists":
+                                  print('Alias already exists, updating values')
+
+                                  ### Find existing alias ###
+                                  existingalias = boto3.client('iam').list_account_aliases()['AccountAliases'][0]
+
+                                  ### Remove it ###
+                                  resp = iam.delete_account_alias(AccountAlias=existingalias)
+
+                                  ### Create with new value ###
+                                  resp = iam.create_account_alias(AccountAlias=alias)
+                                  responseData['alias'] = alias
+                                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, responseData['alias'])
+                              else:
+                                  responseData['exception'] = str(e)
+                                  print(e)
+                                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                          except Exception as e:
+                              responseData['exception'] = str(e)
+                              print(e)
+                              cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+              elif event['RequestType'] == 'Delete':
+                  ### Delete events should do nothing except respond success ###
+                  responseData['alias'] = alias
+                  logger.info('responseData {}'.format(responseData))
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, responseData['alias'])
